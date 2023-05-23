@@ -1,0 +1,230 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  The PoC demonstrates how to automate Amazon CloudWatch log group subscription to to an Amazon OpenSearch cluster via an AWS Lambda function when the CloudWatch log group is created.
+
+  Be aware of the security configurations DO NOT reach the production level in order to make testing easier. Please enhance the security according to your security requirements before deploy it to any production environments.
+
+Parameters:
+  OpenSearchServiceName:
+    Description: The OpenSearch service name for access. Serverless is aoss, Provision is es.
+    Type: String
+    Default: 'aoss'
+    AllowedValues:
+    - 'aoss'
+    - 'es'
+  OpenSearchCollectionName:
+    Description: The OpenSearch serverless collection name to store CloudWatch logs.
+    Type: String
+    Default: 'useast1-genai-param-logs'
+  EventBridgeRulePrefixForLogGroupName:
+    Description: The Prefix of CloudWatch Log Group Name that EventBridge will match.
+    Type: String
+    Default: '/aws/sagemaker/Endpoints/all-in-one-ai'
+  CloudWatchFilterName: 
+    Description: The CloudWatch Log Group filter name for subscription configuration.
+    Type: String
+    Default: 'lambda-to-opensearch-serverless'
+  CloudWatchFilterPattern: 
+    Description: The CloudWatch Log Group filter pattern for filtering logs before passing them to the destination.
+    Type: String
+    Default: '[ type = task*, uname, ... ]'
+  IamRoleArnForLambda1:
+    Description: The ARN for IAM role for Lambda function.
+    Type: String
+    Default: 'arn:aws:iam::ACCOUNT_ID:role/poc-stack-iam-roles-LambdaExecutionRole1'
+  SnsSubscriptionEmail:
+    Description: The email address for the SNS subscription.
+    Type: String
+    Default: 'dev@example.com'
+
+Globals:
+  Function:
+    Timeout: 10
+    Environment:
+      Variables:
+        ES_SERVICE_NAME: aoss
+        ES_INDEX_PREFIX: sagemaker-log
+
+Resources:
+  # An IAM role for Lambda access to OpenSearch
+  IamRoleForLambdaToOpenSearch:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: lambda-execution-role-with-aos-access-2
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonOpenSearchServiceFullAccess'
+        - 'arn:aws:iam::aws:policy/CloudWatchFullAccess'
+      Policies:
+        - PolicyName: 'lambda-opensearch-serverless-access-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'aoss:*'
+                  # - 'es:*'
+                Resource: '*'
+
+  # An OpenSearch Serverless collection using CloudFormation
+  ## Create OpenSearch security policies
+  DataAccessPolicy:
+    Type: 'AWS::OpenSearchServerless::AccessPolicy'
+    Properties:
+      Name: lambda-access-policy
+      Type: data
+      Description: Access policy for cloudwatch log collection
+      Policy: !Sub >-
+        [{"Description":"Access for cfn user","Rules":[{"ResourceType":"index","Resource":["index/*/*"],"Permission":["aoss:*"]},
+        {"ResourceType":"collection","Resource":["collection/${OpenSearchCollectionName}"],"Permission":["aoss:*"]}],
+        "Principal":["${IamRoleForLambdaToOpenSearch.Arn}"]}]
+  
+  NetworkPolicy:
+    Type: 'AWS::OpenSearchServerless::SecurityPolicy'
+    Properties:
+      Name: lambda-access-network-policy
+      Type: network
+      Description: Network policy for cloudwatch log collection
+      Policy: !Sub >-
+        [{"Rules":[{"ResourceType":"collection","Resource":["collection/${OpenSearchCollectionName}"]}, {"ResourceType":"dashboard","Resource":["collection/*"]}],"AllowFromPublic":true}]
+  
+  EncryptionPolicy:
+    Type: 'AWS::OpenSearchServerless::SecurityPolicy'
+    Properties:
+      Name: lambda-access-security-policy
+      Type: encryption
+      Description: Encryption policy for cloudwatch log collection
+      Policy: !Sub >-
+        {"Rules":[{"ResourceType":"collection","Resource":["collection/${OpenSearchCollectionName}"]}],"AWSOwnedKey":true}
+
+  ## The Amazon OpenSearch serverless collection for log storageß
+  OpenSearchServerlessCollection:
+    Type: 'AWS::OpenSearchServerless::Collection'
+    DependsOn: EncryptionPolicy
+    Properties:
+      Name: !Ref OpenSearchCollectionName
+      Type: SEARCH
+      Description: Collection to holds timeseries data
+
+  # Create the EventBridge rule for CloudWatch log group creation.
+  EventBridgeEventRule1:
+    DependsOn: AddSubscriptionFilterFunction
+    Type: AWS::Events::Rule
+    Properties:
+      Description: The rule catches the creation event of a new CloudWatch log group
+      EventBusName: default
+      EventPattern:
+        source:
+          - aws.logs
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - logs.amazonaws.com
+          eventName:
+            - CreateLogGroup
+          requestParameters:
+            logGroupName:
+              - prefix: !Ref EventBridgeRulePrefixForLogGroupName
+      Name: cloudwatch-log-group-creation-1
+      State: ENABLED
+      Targets:
+        - Id: Ide69bf0d7-eb69-4715-b1b1-fabe4f4f17b3
+          Arn: !GetAtt AddSubscriptionFilterFunction.Arn
+
+  # Lambda functions: Add a subscription to CloudWatch, subscribe a log group
+  ## Lambda Function - Add the subscription filter to CloudWatch log groups
+  AddSubscriptionFilterFunction:
+    DependsOn: SubscriptionFilterIngestLogToAOSFunction
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: This lambda Function can read event when a new CloudWatch logGroup creation event is captured by EventBridge and automatically subscribes it to Target OpenSearch
+      CodeUri: src/
+      Handler: automated-add-cloudwatch-subscription.lambda_handler
+      Runtime: python3.8
+      Architectures:
+        - arm64
+      Timeout: 60
+      MemorySize: 1024
+      Role: !Ref IamRoleArnForLambda1
+      Tracing: Active
+      Environment:
+        Variables:
+          TARGET_LAMBDA_FUNCTION_ARN: !GetAtt SubscriptionFilterIngestLogToAOSFunction.Arn
+          CLOUDWATCH_FILTER_NAME: !Ref CloudWatchFilterName
+          CLOUDWATCH_FILTER_PATTERN: !Ref CloudWatchFilterPattern
+
+  ## Grant permission to EventBridge to invoke the Lambda function
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: 
+        !Ref AddSubscriptionFilterFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "EventBridgeEventRule1"
+          - "Arn"
+
+  ## Lambda Function - Add the subscription filter to CloudWatch log groups
+  SubscriptionFilterIngestLogToAOSFunction:
+    DependsOn: OpenSearchServerlessCollection
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: This lambda Function is called by CloudWatch subscription filter. It processes CloudWatch logs and ingest logs into targeted OpenSearch.
+      CodeUri: src/
+      Handler: ingest-cloudwatch-logs-to-es.lambda_handler
+      Runtime: python3.8
+      Architectures:
+        - x86_64
+      Timeout: 300
+      MemorySize: 1024
+      Role: !GetAtt IamRoleForLambdaToOpenSearch.Arn
+      Tracing: Active
+      Environment:
+        Variables:
+          ES_HOST: 
+            Fn::Select: 
+              - 1
+              - Fn::Split:
+                - 'https://'
+                - Fn::GetAtt: [OpenSearchServerlessCollection, CollectionEndpoint]
+
+  ## Grant permission to CloudWatch to invoke the Lambda function for subscription
+  PermissionForLogsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: 
+        !Ref SubscriptionFilterIngestLogToAOSFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "logs.amazonaws.com"
+      SourceArn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*:*'
+      SourceAccount: !Ref AWS::AccountId
+  
+  ## Lambda Function - Add the subscription filter to CloudWatch log groups
+  CreateAOSIndexFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: This lambda Function tries to create an OpenSearch index according to the SageMaker task type.
+      CodeUri: src/
+      Handler: create_aos_index.lambda_handler
+      Runtime: python3.8
+      Architectures:
+        - x86_64
+      Timeout: 10
+      MemorySize: 1024
+      Role: !GetAtt IamRoleForLambdaToOpenSearch.Arn
+      Tracing: Active
+
+Outputs:
+  OpenSearchCollectionDashboard:
+    Description: "The OpenSearch collection dashboard endpoint for log storage."
+    Value: !GetAtt OpenSearchServerlessCollection.DashboardEndpoint
